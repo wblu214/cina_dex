@@ -1,66 +1,157 @@
-## Foundry
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+-----
 
-Foundry consists of:
+### CINA Dex 协议核心参数设计 (Protocol Configuration)
 
-- **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
-- **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
-- **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
-- **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+我们将以最经典的 **ETH-USDT 30天固定期限资金池** 为例。
 
-## Documentation
+#### 1\. 资产与抵押规则 (Risk Parameters)
 
-https://book.getfoundry.sh/
+这是风控的核心，决定了用户能借多少钱，以及什么时候会被强平。
 
-## Usage
+| 参数名称 | 英文名称 | 设定数值 | 含义与设计理由 |
+| :--- | :--- | :--- | :--- |
+| **最大抵押率** | **Max LTV** | **75%** | **含义**：抵押 100 U 的 ETH，最多能借 75 U 的 USDT。<br>**理由**：主流配置。给市场波动留出了 25% 的安全缓冲。 |
+| **清算阈值** | **Liquidation Threshold** | **80%** | **含义**：当债务价值占抵押物价值达到 80% 时，触发清算。<br>**理由**：80% - 75% = 5% 的缓冲带，防止用户刚借完钱稍微跌一点就被清算。 |
+| **清算罚金** | **Liquidation Penalty** | **5%** | **含义**：被清算时，额外扣除 5% 的抵押物。<br>**理由**：这是给清算人的“肉”，必须有这个利润空间，清算机器人还会来干活。 |
+| **清算奖励分配** | **Bonus Split** | **4% / 1%** | **含义**：5% 的罚金中，**4% 给清算人**，**1% 给协议保险库**。<br>**理由**：你的商业模式之一。 |
 
-### Build
+-----
 
-```shell
-$ forge build
+#### 2\. 利率与收益规则 (Interest Rate Model)
+
+这是商业模式的核心，决定了借款成本和平台利润。
+由于是**固定期限（Fixed Term）**，我们使用**年化利率 (APR)** 来换算具体利息。
+
+| 参数名称 | 英文名称 | 设定数值 | 含义与设计理由 |
+| :--- | :--- | :--- | :--- |
+| **借款固定年化** | **Fixed Borrow APR** | **10%** | **含义**：借款人锁定的年化成本。<br>**理由**：这通常比浮动利率稍高一点（溢价），因为用户买到了“确定性”。 |
+| **存款固定年化** | **Fixed Supply APY** | **8.5%** | **含义**：贷款人（LP）锁定的年化收益。<br>**理由**：必须有吸引力才能拉来资金。 |
+| **利差 (平台收入)** | **Spread / Reserve** | **1.5%** | **含义**：借款 10% - 存款 8.5% = 1.5% 利差。<br>**理由**：这是协议的**核心利润**（Reserve Factor）。 |
+
+-----
+
+### 3\. 全流程数值演示 (Scenario Walkthrough)
+
+面试时，不要只背数字。用下面这个**具体的算账过程**，把所有参数串起来讲，逻辑会非常清晰。
+
+#### 场景设定
+
+* **用户**：Alice（借款人）
+* **当前 ETH 价格**：$2,000
+* **借款需求**：Alice 想要借 **7,500 USDT**。
+* **期限**：1年（为了方便计算，假设期限是一整年，实际中按天数折算）。
+
+#### 第一步：借款 (Borrow)
+
+1.  **抵押计算**：
+    * Alice 想借 7,500 U。
+    * LTV 是 75%。
+    * 需要抵押物价值 = $7,500 \div 75\% = 10,000$ USDT。
+    * 换算成 ETH = $10,000 \div 2,000 = \mathbf{5\ ETH}$。
+2.  **利息计算 (前端收取)**：
+    * 借款年化 10%。
+    * 一年利息 = $7,500 \times 10\% = \mathbf{750\ USDT}$。
+    * **协议利润**：其中 $7,500 \times 1.5\% = 112.5$ U 进入你的金库。
+    * **Lender 收益**：其中 $7,500 \times 8.5\% = 637.5$ U 留给贷款人。
+3.  **最终记账**：
+    * Alice 抵押了 **5 ETH**。
+    * Alice 拿走了 **7,500 USDT**。
+    * Alice 欠合约 **8,250 USDT** (7500 本金 + 750 利息)。*注：固定利率通常把利息算进债务里。*
+
+#### 第二步：清算风险 (Liquidation Risk)
+
+时间过了几个月，**ETH 暴跌至 $1,300**。
+
+1.  **健康度检查**：
+    * Alice 的债务（连本带利）：**8,250 U**。
+    * Alice 的抵押物（5 ETH）：$5 \times 1,300 = \mathbf{6,500\ U}$。
+    * **如果你按照债务总额算 LTV**：$8,250 \div 6,500 = 126\%$ -\> **早就穿仓了！**
+    * *(这里有个细节：通常在借款时，LTV是基于本金计算初始额度，但清算线是基于总债务计算的)*。
+
+**修正场景（为了演示清算触发）：**
+假设 ETH 跌到了 **$1,700**。
+
+* 抵押物价值 = $5 \times 1,700 = 8,500$ U。
+* 债务 = 8,250 U。
+* 当前占比 = $8,250 \div 8,500 = \mathbf{97\%}$。
+* **结论**：$97\% > 80\%$ (清算阈值)，**触发清算！**
+
+#### 第三步：执行清算 (Execution)
+
+清算人 Bob 来帮 Alice 还一半的钱（假设清算一半，即 4,125 U）。
+
+1.  **罚金计算**：
+
+    * Bob 支付：**4,125 USDT**（帮 Alice 还债）。
+    * Bob 获得的 ETH 价值 = $4,125 \times (1 + 5\%) = \mathbf{4,331.25\ USDT}$。
+    * 换算成 ETH = $4,331.25 \div 1,700 \approx \mathbf{2.547\ ETH}$。
+
+2.  **利润分配**：
+
+    * 总罚金价值 = $4,331.25 - 4,125 = 206.25$ U。
+    * **清算人 Bob 赚 (4/5)**：$206.25 \times 80\% = \mathbf{165\ U}$。
+    * **CINA 协议赚 (1/5)**：$206.25 \times 20\% = \mathbf{41.25\ U}$。
+
+-----
+
+### 4\. 代码中如何体现这些规则？
+
+在你的 Solidity 代码中，用 `constant` 常量定义这些规则，显得非常规范：
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract CINAConfig {
+    // 1. 抵押率 75% (分母 100)
+    uint256 public constant MAX_LTV = 75; 
+    
+    // 2. 清算阈值 80%
+    uint256 public constant LIQUIDATION_THRESHOLD = 80;
+    
+    // 3. 总罚金 5%
+    uint256 public constant LIQUIDATION_BONUS = 5;
+    
+    // 4. 协议在罚金中的抽成 20% (即 5% * 20% = 1% 总额)
+    uint256 public constant PROTOCOL_LIQUIDATION_SHARE = 20;
+
+    // 5. 借款年化利率 (基点 10000, 1000 = 10%)
+    uint256 public constant BORROW_APR_BPS = 1000;
+    
+    // 6. 协议利差储备金率 (占利息的 15%)
+    // 10% APR 中，1.5% 给协议，8.5% 给 LP，所以 reserve factor = 15%
+    uint256 public constant RESERVE_FACTOR = 15; 
+}
 ```
 
-### Test
+### 总结
 
-```shell
-$ forge test
-```
+这套规则是一个非常标准的 **DeFi 借贷模型**：
 
-### Format
+1.  **LTV 75%**：让用户能借出足够的钱。
+2.  **清算线 80%**：给用户 5% 的喘息空间。
+3.  **罚金 5%**：保证清算人有动力干活。
+4.  **利差 1.5%** + **清算抽成 1%**：保证你的项目能持续赚钱。
 
-```shell
-$ forge fmt
-```
-
-### Gas Snapshots
-
-```shell
-$ forge snapshot
-```
-
-### Anvil
-
-```shell
-$ anvil
-```
-
-### Deploy
-
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
-```
-
-### Cast
-
-```shell
-$ cast <subcommand>
-```
-
-### Help
-
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
+```solidity
+cina-dex/
+├── lib/                        # 依赖库 (OpenZeppelin 在这里)
+├── src/                        # [核心代码]
+│   ├── core/                   # 核心业务
+│   │   ├── LendingPool.sol
+│   │   └── PoolFactory.sol
+│   ├── tokens/                 # 代币
+│   │   └── FToken.sol
+│   ├── libraries/              # 数学库
+│   │   └── InterestMath.sol
+│   ├── interfaces/             # 接口
+│   │   ├── IOracle.sol
+│   │   └── ILendingPool.sol
+│   └── mocks/                  # 本地测试用的假合约
+│       ├── MockUSDT.sol
+│       └── MockOracle.sol
+├── test/                       # [测试代码 - Solidity编写]
+│   ├── FToken.t.sol            # 对应测试
+│   └── LendingPool.t.sol
 ```
