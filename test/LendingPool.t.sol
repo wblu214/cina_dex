@@ -140,6 +140,75 @@ contract LendingPoolTest is Test {
         assertFalse(isLiquidatable);
     }
 
+    // 测试 4: 正常还款流程 (验证利息和汇率增长)
+    function testRepayFlow() public {
+        // 1. Alice 存款
+        vm.startPrank(alice);
+        usdt.approve(address(pool), 10000 * 1e6);
+        pool.deposit(10000 * 1e6);
+        vm.stopPrank();
+
+        // 2. Bob 借款
+        mockChainlinkPrice(2000 * 1e8);
+        vm.startPrank(bob);
+        // 抵押 1 ETH ($2000), 借 1000 USDT (1年期)
+        // 利息 = 1000 * 10% = 100 USDT
+        pool.borrow{value: 1 ether}(1000 * 1e6, 365 days);
+        vm.stopPrank();
+
+        // 3. Bob 还款
+        // Bob 需要还 1100 USDT，但他手里只有借来的 1000 USDT
+        // 给 Bob 发点钱付利息
+        usdt.mint(bob, 100 * 1e6);
+
+        vm.startPrank(bob);
+        usdt.approve(address(pool), 1100 * 1e6);
+        pool.repay(0); // Loan ID 0
+        vm.stopPrank();
+
+        // 4. 验证状态
+        // Bob 拿回了 ETH
+        assertEq(bob.balance, 10 ether);
+
+        // 验证 LP 汇率增长 (Alice 赚了利息)
+        // 池子资金: 10000 (本金) + 100 (利息) = 10100
+        // 汇率 = 10100 / 10000 = 1.01
+        assertEq(pool.getExchangeRate(), 1.01 * 1e18);
+    }
+
+    // 测试 5: 异常测试 - 抵押不足
+    function testCannotBorrowInsufficientCollateral() public {
+        mockChainlinkPrice(2000 * 1e8);
+        vm.startPrank(bob);
+        // 1 ETH = $2000. Max LTV 75% = $1500.
+        // 试图借 $1600 -> 应该失败
+        vm.expectRevert("Insufficient collateral");
+        pool.borrow{value: 1 ether}(1600 * 1e6, 30 days);
+        vm.stopPrank();
+    }
+
+    // 测试 6: 异常测试 - 试图清算健康贷款
+    function testCannotLiquidateHealthyLoan() public {
+        // 准备环境
+        vm.startPrank(alice);
+        usdt.approve(address(pool), 5000 * 1e6);
+        pool.deposit(5000 * 1e6);
+        vm.stopPrank();
+
+        mockChainlinkPrice(2000 * 1e8);
+        vm.startPrank(bob);
+        pool.borrow{value: 1 ether}(1000 * 1e6, 30 days);
+        vm.stopPrank();
+
+        // 试图在价格未跌时清算
+        vm.startPrank(liquidator);
+        usdt.approve(address(pool), 2000 * 1e6);
+
+        vm.expectRevert("Health factor ok");
+        pool.liquidate(0);
+        vm.stopPrank();
+    }
+
     // 辅助函数: 模拟 Chainlink 返回值
     function mockChainlinkPrice(int256 price) internal {
         vm.mockCall(
