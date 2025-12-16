@@ -15,8 +15,8 @@ contract DeployLendingPool is Script {
     function run() external {
         // 1. 读取当前网络配置（USDT + priceFeed）
         HelperConfig helper = new HelperConfig();
-        HelperConfig.NetworkConfig memory cfg =
-            helper.getActiveNetworkConfigByChainId(block.chainid);
+        HelperConfig.NetworkConfig memory cfg = helper
+            .getActiveNetworkConfigByChainId(block.chainid);
 
         vm.startBroadcast();
 
@@ -28,7 +28,11 @@ contract DeployLendingPool is Script {
         FToken fToken = new FToken("CINA LP Token", "cUSDT");
 
         // 4. 部署 LendingPool，注入 USDT、FToken、Oracle
-        LendingPool pool = new LendingPool(cfg.usdt, address(fToken), address(oracle));
+        LendingPool pool = new LendingPool(
+            cfg.usdt,
+            address(fToken),
+            address(oracle)
+        );
 
         // 5. 将 FToken 的铸造权限转交给池子
         fToken.transferOwnership(address(pool));
@@ -43,4 +47,3 @@ contract DeployLendingPool is Script {
         console2.log("LendingPool:", address(pool));
     }
 }
-
