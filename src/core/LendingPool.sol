@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -212,6 +212,33 @@ contract LendingPool is CINAConfig, ReentrancyGuard, Ownable {
         return (totalAssets * 1e18) / totalSupply;
     }
 
+    /// @notice Returns an aggregate view of the pool state for off‑chain indexers.
+    /// @return totalAssets          Current total assets (USDT in pool + outstanding principal).
+    /// @return totalBorrowed_       Total outstanding borrowed principal.
+    /// @return availableLiquidity   USDT balance currently held by the pool.
+    /// @return exchangeRate         Current fToken exchange rate (18‑decimals WAD).
+    /// @return totalFTokenSupply    Total fToken supply.
+    function getPoolState()
+        external
+        view
+        returns (
+            uint256 totalAssets,
+            uint256 totalBorrowed_,
+            uint256 availableLiquidity,
+            uint256 exchangeRate,
+            uint256 totalFTokenSupply
+        )
+    {
+        totalBorrowed_ = totalBorrowed;
+
+        uint256 usdtBalance = usdt.balanceOf(address(this));
+        availableLiquidity = usdtBalance;
+        totalAssets = usdtBalance + totalBorrowed_;
+
+        totalFTokenSupply = fToken.totalSupply();
+        exchangeRate = getExchangeRate();
+    }
+
     /// @notice Returns all active loan IDs for a user.
     function getUserLoans(address user) external view returns (uint256[] memory) {
         uint256 count;
@@ -230,6 +257,44 @@ contract LendingPool is CINAConfig, ReentrancyGuard, Ownable {
         }
 
         return result;
+    }
+
+    /// @notice Returns an aggregate view of a user's active borrowing position.
+    /// @dev Sums over all active loans of the user; intended for off‑chain use.
+    /// @return loanIds        Active loan IDs.
+    /// @return totalPrincipal Sum of principals for all active loans.
+    /// @return totalRepayment Sum of repayment amounts (principal + interest).
+    /// @return totalCollateral Sum of collateral (ETH, in wei) across all active loans.
+    function getUserPosition(
+        address user
+    )
+        external
+        view
+        returns (
+            uint256[] memory loanIds,
+            uint256 totalPrincipal,
+            uint256 totalRepayment,
+            uint256 totalCollateral
+        )
+    {
+        uint256 count;
+        for (uint256 i = 0; i < nextLoanId; i++) {
+            if (loans[i].borrower == user && loans[i].isActive) {
+                count++;
+            }
+        }
+
+        loanIds = new uint256[](count);
+        uint256 idx;
+        for (uint256 i = 0; i < nextLoanId; i++) {
+            Loan storage loan = loans[i];
+            if (loan.borrower == user && loan.isActive) {
+                loanIds[idx++] = i;
+                totalPrincipal += loan.principal;
+                totalRepayment += loan.repaymentAmount;
+                totalCollateral += loan.collateralAmount;
+            }
+        }
     }
 
     /// @notice Returns the current LTV and whether the loan is liquidatable.
