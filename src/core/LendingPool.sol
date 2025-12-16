@@ -3,7 +3,7 @@ pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "../libraries/CINAConfig.sol";
 import "../libraries/InterestMath.sol";
@@ -196,6 +196,64 @@ contract LendingPool is CINAConfig, ReentrancyGuard, Ownable {
         }
 
         emit Liquidate(msg.sender, loanId, amountToRepay, collateralToSeize);
+    }
+
+    // --- 5. View helpers ---
+
+    /// @notice Returns the current LP token exchange rate (18‑decimals WAD).
+    /// @dev When no deposits exist yet, we define the rate as 1e18.
+    function getExchangeRate() public view returns (uint256) {
+        uint256 totalSupply = fToken.totalSupply();
+        if (totalSupply == 0) {
+            return 1e18;
+        }
+
+        uint256 totalAssets = usdt.balanceOf(address(this)) + totalBorrowed;
+        return (totalAssets * 1e18) / totalSupply;
+    }
+
+    /// @notice Returns all active loan IDs for a user.
+    function getUserLoans(address user) external view returns (uint256[] memory) {
+        uint256 count;
+        for (uint256 i = 0; i < nextLoanId; i++) {
+            if (loans[i].borrower == user && loans[i].isActive) {
+                count++;
+            }
+        }
+
+        uint256[] memory result = new uint256[](count);
+        uint256 idx;
+        for (uint256 i = 0; i < nextLoanId; i++) {
+            if (loans[i].borrower == user && loans[i].isActive) {
+                result[idx++] = i;
+            }
+        }
+
+        return result;
+    }
+
+    /// @notice Returns the current LTV and whether the loan is liquidatable.
+    /// @dev LTV is returned as a WAD (1e18 = 100%).
+    function getLoanHealth(
+        uint256 loanId
+    ) external view returns (uint256 ltv, bool isLiquidatable) {
+        Loan storage loan = loans[loanId];
+        if (!loan.isActive) {
+            return (0, false);
+        }
+
+        uint256 ethPrice = oracle.getPrice(address(0));
+        uint256 collateralValue = (loan.collateralAmount * ethPrice) / 1e18;
+        if (collateralValue == 0) {
+            // No collateral means the position is obviously bad.
+            return (0, true);
+        }
+
+        uint256 debtValue = loan.repaymentAmount * 1e12; // USDT(6) -> 18 decimals
+        ltv = (debtValue * 1e18) / collateralValue;
+
+        isLiquidatable =
+            debtValue * 100 >= collateralValue * LIQUIDATION_THRESHOLD;
     }
 
     // 接收 ETH
