@@ -18,19 +18,18 @@ contract LendingPoolTest is Test {
     address bob = makeAddr("bob");
     address liquidator = makeAddr("liquidator");
 
-    // Sepolia ETH/USD Aggregator Address (真实地址)
+    // 示例 ETH/USD Aggregator Address（仅用于测试中 mock 价格）
     address constant SEPOLIA_ETH_USD_FEED =
         0x694AA1769357215DE4FAC081bf1f309aDC325306;
 
     function setUp() public {
         // 1. 部署基础合约
-        // 注意：在真实部署中，这里会是真实的 USDT 地址，测试用 Mock
+        // 注意：在真实部署中，这里会是真实的 USDT 地址，当前用 Mock
         usdt = new MockUSDT();
         fToken = new FToken("CINA LP Token", "cUSDT");
         oracle = new ChainlinkOracle();
 
-        // 2. 配置预言机 (指向 Sepolia 真实地址)
-        // 运行测试时需带上 --fork-url <SEPOLIA_RPC>
+        // 2. 配置预言机 (填入一个价格源地址，测试中通过 vm.mockCall 注入价格)
         oracle.setPriceFeed(address(0), SEPOLIA_ETH_USD_FEED);
 
         // 3. 部署核心池
@@ -44,11 +43,11 @@ contract LendingPoolTest is Test {
         usdt.mint(alice, 10000 * 1e6);
         // 给 Liquidator 10,000 USDT (用于清算)
         usdt.mint(liquidator, 10000 * 1e6);
-        // 给 Bob 10 ETH (用于抵押)
+        // 给 Bob 10 单位原生币 (用于抵押，测试环境里仍用 ether 计价)
         vm.deal(bob, 10 ether);
     }
 
-    // 测试 1: 验证能否读取真实链上价格
+    // 测试 1: 验证能否读取真实链上价格（在有 fork 时）
     function testGetRealPrice() public {
         try oracle.getPrice(address(0)) returns (uint256 price) {
             console.log("Real ETH Price from Sepolia (WAD):", price);
@@ -78,17 +77,17 @@ contract LendingPoolTest is Test {
         mockChainlinkPrice(2000 * 1e8);
 
         vm.startPrank(bob);
-        // 抵押 1 ETH ($2000)
+        // 抵押 1 单位原生币 ($2000)
         // LTV 75% -> Max Borrow $1500
         // Bob 借款 1000 USDT (安全范围内)
         pool.borrow{value: 1 ether}(1000 * 1e6, 30 days);
         vm.stopPrank();
 
         assertEq(usdt.balanceOf(bob), 1000 * 1e6, "Bob should receive USDT");
-        assertEq(address(pool).balance, 1 ether, "Pool should hold ETH");
+        assertEq(address(pool).balance, 1 ether, "Pool should hold collateral");
 
         // --- Step 3: 价格暴跌触发清算 ---
-        // 模拟 ETH 价格跌到 $1100
+        // 模拟原生币价格跌到 $1100
         // 抵押物价值 $1100
         // 债务 ~1000 (忽略利息)
         // 当前 LTV = 1000/1100 = 90.9% > 80% (清算阈值) -> 触发清算
@@ -98,15 +97,15 @@ contract LendingPoolTest is Test {
         usdt.approve(address(pool), 2000 * 1e6);
 
         uint256 loanId = 0; // 第一个贷款 ID 为 0
-        uint256 ethBefore = liquidator.balance;
+        uint256 balBefore = liquidator.balance;
 
         pool.liquidate(loanId);
 
-        uint256 ethAfter = liquidator.balance;
+        uint256 balAfter = liquidator.balance;
 
-        // 验证清算人获得了 ETH 奖励
-        assertTrue(ethAfter > ethBefore, "Liquidator should receive ETH");
-        console.log("Liquidator Profit (ETH Wei):", ethAfter - ethBefore);
+        // 验证清算人获得了原生币奖励
+        assertTrue(balAfter > balBefore, "Liquidator should receive native token");
+        console.log("Liquidator Profit (wei):", balAfter - balBefore);
 
         vm.stopPrank();
     }
@@ -151,7 +150,7 @@ contract LendingPoolTest is Test {
         // 2. Bob 借款
         mockChainlinkPrice(2000 * 1e8);
         vm.startPrank(bob);
-        // 抵押 1 ETH ($2000), 借 1000 USDT (1年期)
+        // 抵押 1 单位原生币 ($2000), 借 1000 USDT (1年期)
         // 利息 = 1000 * 10% = 100 USDT
         pool.borrow{value: 1 ether}(1000 * 1e6, 365 days);
         vm.stopPrank();
@@ -167,7 +166,7 @@ contract LendingPoolTest is Test {
         vm.stopPrank();
 
         // 4. 验证状态
-        // Bob 拿回了 ETH
+        // Bob 拿回了抵押的原生币
         assertEq(bob.balance, 10 ether);
 
         // 验证 LP 汇率增长 (Alice 赚了利息)
@@ -180,7 +179,7 @@ contract LendingPoolTest is Test {
     function testCannotBorrowInsufficientCollateral() public {
         mockChainlinkPrice(2000 * 1e8);
         vm.startPrank(bob);
-        // 1 ETH = $2000. Max LTV 75% = $1500.
+        // 1 单位原生币 = $2000. Max LTV 75% = $1500.
         // 试图借 $1600 -> 应该失败
         vm.expectRevert("Insufficient collateral");
         pool.borrow{value: 1 ether}(1600 * 1e6, 30 days);

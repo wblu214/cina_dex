@@ -19,7 +19,7 @@ contract LendingPool is CINAConfig, ReentrancyGuard, Ownable {
 
     struct Loan {
         address borrower;
-        uint256 collateralAmount; // ETH 数量 (Wei)
+        uint256 collateralAmount; // 原生代币数量 (wei)，在 BSC 上为 BNB
         uint256 principal; // 借款本金 (USDT)
         uint256 repaymentAmount; // 应还总额 (本金 + 利息)
         uint256 startTime;
@@ -88,12 +88,12 @@ contract LendingPool is CINAConfig, ReentrancyGuard, Ownable {
         require(msg.value > 0, "Collateral required");
         require(duration > 0, "Duration required");
 
-        // A. 获取 ETH 价格 (假设 Oracle 返回 18位精度)
-        uint256 ethPrice = oracle.getPrice(address(0));
-        require(ethPrice > 0, "Invalid price");
+        // A. 获取原生代币价格 (假设 Oracle 返回 18位精度)
+        uint256 nativePrice = oracle.getPrice(address(0));
+        require(nativePrice > 0, "Invalid price");
 
         // B. 计算抵押物价值 (USD, 18 decimals)
-        uint256 collateralValue = (msg.value * ethPrice) / 1e18;
+        uint256 collateralValue = (msg.value * nativePrice) / 1e18;
 
         // C. 计算最大可借额度 (LTV 75%)
         uint256 maxBorrowValue = (collateralValue * MAX_LTV) / 100;
@@ -143,7 +143,7 @@ contract LendingPool is CINAConfig, ReentrancyGuard, Ownable {
         totalBorrowed -= loan.principal; // 债务消除
 
         (bool success, ) = payable(loan.borrower).call{value: collateral}("");
-        require(success, "ETH transfer failed");
+        require(success, "Native transfer failed");
 
         emit Repay(loan.borrower, loanId, amount);
     }
@@ -153,9 +153,9 @@ contract LendingPool is CINAConfig, ReentrancyGuard, Ownable {
         Loan storage loan = loans[loanId];
         require(loan.isActive, "Loan inactive");
 
-        // A. 检查健康度
-        uint256 ethPrice = oracle.getPrice(address(0));
-        uint256 collateralValue = (loan.collateralAmount * ethPrice) / 1e18;
+        // A. 检查健康度（基于原生代币价格）
+        uint256 nativePrice = oracle.getPrice(address(0));
+        uint256 collateralValue = (loan.collateralAmount * nativePrice) / 1e18;
         uint256 debtValue = loan.repaymentAmount * 1e12; // 转 18位
 
         // 触发条件: 债务价值 / 抵押价值 >= 80%
@@ -168,10 +168,10 @@ contract LendingPool is CINAConfig, ReentrancyGuard, Ownable {
         uint256 amountToRepay = loan.repaymentAmount;
         usdt.safeTransferFrom(msg.sender, address(this), amountToRepay);
 
-        // C. 计算清算奖励 (清算人拿走: 债务价值 * 104% 的 ETH)
+        // C. 计算清算奖励 (清算人拿走: 债务价值 * 104% 的原生代币)
         // 4% 给清算人 (5% 总罚金 * 80% 分成)
         uint256 liquidatorValue = (amountToRepay * 104) / 100;
-        uint256 collateralToSeize = (liquidatorValue * 1e30) / ethPrice; // USDT(6) -> 18 -> /Price
+        uint256 collateralToSeize = (liquidatorValue * 1e30) / nativePrice; // USDT(6) -> 18 -> /Price
 
         // 防止坏账 (Bad Debt): 如果抵押物不够赔，清算人拿走所有
         if (collateralToSeize > loan.collateralAmount) {
