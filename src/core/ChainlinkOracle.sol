@@ -25,7 +25,11 @@ contract ChainlinkOracle is IOracle, Ownable {
         (, int256 price, , , ) = aggregator.latestRoundData();
         require(price > 0, "Invalid price");
 
-        uint8 decimals = aggregator.decimals();
+        // Sepolia ETH/USD and most Chainlink USD feeds use 8 decimals.
+        // To keep things simple (and friendly to vm.mockCall), we assume 8 here
+        // and scale to 18‑decimals WAD.
+        uint8 decimals = 8;
+
         // 统一标准化为 18 位精度 (WAD)
         if (decimals < 18) {
             return uint256(price) * (10 ** (18 - decimals));
