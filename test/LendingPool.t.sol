@@ -209,6 +209,114 @@ contract LendingPoolTest is Test {
         vm.stopPrank();
     }
 
+    // 测试 7: getPoolState 聚合信息是否正确
+    function testGetPoolState() public {
+        // Alice 存款 5000 USDT
+        vm.startPrank(alice);
+        usdt.approve(address(pool), 5000 * 1e6);
+        pool.deposit(5000 * 1e6);
+        vm.stopPrank();
+
+        // Bob 按固定价格借 1000 USDT
+        mockChainlinkPrice(2000 * 1e8);
+        vm.startPrank(bob);
+        pool.borrow{value: 1 ether}(1000 * 1e6, 30 days);
+        vm.stopPrank();
+
+        (
+            uint256 totalAssets,
+            uint256 totalBorrowed_,
+            uint256 availableLiquidity,
+            uint256 exchangeRate,
+            uint256 totalFTokenSupply
+        ) = pool.getPoolState();
+
+        // 池子应有: 5000 存款资产
+        assertEq(totalAssets, 5000 * 1e6);
+        // 借出本金: 1000
+        assertEq(totalBorrowed_, 1000 * 1e6);
+        // 可用流动性: 5000 - 1000 = 4000
+        assertEq(availableLiquidity, 4000 * 1e6);
+        // 初始 LP 份额: 5000
+        assertEq(totalFTokenSupply, 5000 * 1e6);
+        // 汇率仍为 1e18
+        assertEq(exchangeRate, 1e18);
+    }
+
+    // 测试 8: getUserPosition 聚合多笔贷款
+    function testGetUserPositionAggregatesLoans() public {
+        // Alice 先存入足够流动性
+        vm.startPrank(alice);
+        usdt.approve(address(pool), 5000 * 1e6);
+        pool.deposit(5000 * 1e6);
+        vm.stopPrank();
+
+        // 固定价格
+        mockChainlinkPrice(2000 * 1e8);
+
+        // Bob 开两笔贷款
+        vm.startPrank(bob);
+        pool.borrow{value: 1 ether}(1000 * 1e6, 30 days); // loanId = 0
+        pool.borrow{value: 1 ether}(500 * 1e6, 60 days); // loanId = 1
+        vm.stopPrank();
+
+        (
+            uint256[] memory loanIds,
+            uint256 totalPrincipal,
+            uint256 totalRepayment,
+            uint256 totalCollateral
+        ) = pool.getUserPosition(bob);
+
+        assertEq(loanIds.length, 2);
+        assertEq(loanIds[0], 0);
+        assertEq(loanIds[1], 1);
+
+        // 本金 = 1000 + 500
+        assertEq(totalPrincipal, 1500 * 1e6);
+        // 抵押 = 1 + 1 ETH
+        assertEq(totalCollateral, 2 ether);
+
+        // totalRepayment 应为两笔贷款 repaymentAmount 之和
+        (, , , uint256 repay0, , , ) = pool.loans(0);
+        (, , , uint256 repay1, , , ) = pool.loans(1);
+        assertEq(totalRepayment, repay0 + repay1);
+    }
+
+    // 测试 9: deposit 金额为 0 时应 revert
+    function testCannotDepositZero() public {
+        vm.startPrank(alice);
+        usdt.approve(address(pool), 1);
+        vm.expectRevert("Amount must be > 0");
+        pool.deposit(0);
+        vm.stopPrank();
+    }
+
+    // 测试 10: 已还清的贷款再次还款应失败
+    function testCannotRepayInactiveLoan() public {
+        // Alice 存款
+        vm.startPrank(alice);
+        usdt.approve(address(pool), 2000 * 1e6);
+        pool.deposit(2000 * 1e6);
+        vm.stopPrank();
+
+        // Bob 借款
+        mockChainlinkPrice(2000 * 1e8);
+        vm.startPrank(bob);
+        pool.borrow{value: 1 ether}(500 * 1e6, 30 days);
+        vm.stopPrank();
+
+        // 给 Bob 足够 USDT 还款
+        usdt.mint(bob, 1000 * 1e6);
+
+        vm.startPrank(bob);
+        usdt.approve(address(pool), type(uint256).max);
+        pool.repay(0); // 第一次成功
+
+        vm.expectRevert("Loan inactive");
+        pool.repay(0); // 第二次应失败
+        vm.stopPrank();
+    }
+
     // 辅助函数: 模拟 Chainlink 返回值
     function mockChainlinkPrice(int256 price) internal {
         vm.mockCall(
