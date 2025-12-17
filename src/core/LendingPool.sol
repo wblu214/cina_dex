@@ -32,6 +32,7 @@ contract LendingPool is CINAConfig, ReentrancyGuard, Ownable {
     mapping(uint256 => Loan) public loans;
 
     event Deposit(address indexed user, uint256 amount, uint256 fTokensMinted);
+    event Withdraw(address indexed user, uint256 shares, uint256 amount);
     event Borrow(
         address indexed user,
         uint256 loanId,
@@ -77,6 +78,39 @@ contract LendingPool is CINAConfig, ReentrancyGuard, Ownable {
         fToken.mint(msg.sender, shares);
 
         emit Deposit(msg.sender, amount, shares);
+    }
+
+    /// @notice 赎回存款：按金额取回 USDT，由合约计算需要销毁多少 LP 份额。
+    /// @dev 按照当前池子总资产与 LP 总份额按比例计算，类似 ERC4626 的 withdraw(assets)。
+    ///      如果池子里可用 USDT 不足（大部分资金被借出），会 revert。
+    /// @param amount 要赎回的 USDT 数量（与 deposit 的 amount 一样是 6 位精度）。
+    function withdraw(uint256 amount) external nonReentrant {
+        require(amount > 0, "Amount must be > 0");
+
+        uint256 totalSupply = fToken.totalSupply();
+        require(totalSupply > 0, "No supply");
+
+        // 总资产 = 池子当前持有的 USDT + 借出去的本金（未结算利息在 repaymentAmount 中）
+        uint256 usdtBalance = usdt.balanceOf(address(this));
+        uint256 totalAssets = usdtBalance + totalBorrowed;
+
+        // 实际可提取金额不能超过当前池子中的 USDT 余额
+        require(usdtBalance >= amount, "Insufficient liquidity");
+
+        // 需要销毁的 LP 份额：shares = amount * totalSupply / totalAssets （向上取整避免提少）
+        uint256 shares = (amount * totalSupply) / totalAssets;
+        if (shares * totalAssets < amount * totalSupply) {
+            shares += 1;
+        }
+
+        require(shares > 0, "Shares must be > 0");
+        require(fToken.balanceOf(msg.sender) >= shares, "Insufficient shares");
+
+        // 销毁用户的 LP 份额并转出 USDT
+        fToken.burn(msg.sender, shares);
+        usdt.safeTransfer(msg.sender, amount);
+
+        emit Withdraw(msg.sender, shares, amount);
     }
 
     // --- 2. 借款逻辑 (Borrower) ---
@@ -149,6 +183,9 @@ contract LendingPool is CINAConfig, ReentrancyGuard, Ownable {
     }
 
     // --- 4. 清算逻辑 ---
+
+    /// @notice 主动清算：基于健康度（价格/LTV）触发。
+    /// @dev 只有当 债务价值 / 抵押价值 >= LIQUIDATION_THRESHOLD% 时才允许清算。
     function liquidate(uint256 loanId) external nonReentrant {
         Loan storage loan = loans[loanId];
         require(loan.isActive, "Loan inactive");
@@ -163,6 +200,32 @@ contract LendingPool is CINAConfig, ReentrancyGuard, Ownable {
             debtValue * 100 >= collateralValue * LIQUIDATION_THRESHOLD,
             "Health factor ok"
         );
+
+        _executeLiquidation(loanId, loan, nativePrice);
+    }
+
+    /// @notice 到期清算：仅基于时间，到期即可清算（无需价格跌破阈值）。
+    /// @dev 只要当前时间 >= startTime + duration，就允许任意清算人代还并获得奖励。
+    function liquidateExpired(uint256 loanId) external nonReentrant {
+        Loan storage loan = loans[loanId];
+        require(loan.isActive, "Loan inactive");
+        require(
+            block.timestamp >= loan.startTime + loan.duration,
+            "Loan not expired"
+        );
+
+        uint256 nativePrice = oracle.getPrice(address(0));
+
+        _executeLiquidation(loanId, loan, nativePrice);
+    }
+
+    /// @dev 内部清算执行逻辑，供主动清算和到期清算复用。
+    function _executeLiquidation(
+        uint256 loanId,
+        Loan storage loan,
+        uint256 nativePrice
+    ) internal {
+        require(nativePrice > 0, "Invalid price");
 
         // B. 清算人代还全款
         uint256 amountToRepay = loan.repaymentAmount;
@@ -319,6 +382,29 @@ contract LendingPool is CINAConfig, ReentrancyGuard, Ownable {
 
         isLiquidatable =
             debtValue * 100 >= collateralValue * LIQUIDATION_THRESHOLD;
+    }
+
+    /// @notice 查询某个存款人的实时仓位信息（用于前端展示利息）。
+    /// @dev underlyingBalance = fTokenBalance * exchangeRate / 1e18。
+    ///      前端可以用 underlyingBalance 和历史存入/取出记录计算出“已赚利息”。
+    /// @param user 存款人地址。
+    /// @return fTokenBalance 用户当前持有的 LP 份额。
+    /// @return exchangeRate 当前 LP 份额对应的汇率（1e18 精度）。
+    /// @return underlyingBalance 按当前汇率折算的 USDT 数量。
+    function getLenderPosition(
+        address user
+    )
+        external
+        view
+        returns (
+            uint256 fTokenBalance,
+            uint256 exchangeRate,
+            uint256 underlyingBalance
+        )
+    {
+        fTokenBalance = fToken.balanceOf(user);
+        exchangeRate = getExchangeRate();
+        underlyingBalance = (fTokenBalance * exchangeRate) / 1e18;
     }
 
     // 接收 ETH

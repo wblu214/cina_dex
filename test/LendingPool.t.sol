@@ -137,6 +137,16 @@ contract LendingPoolTest is Test {
         (uint256 ltv, bool isLiquidatable) = pool.getLoanHealth(0);
         assertTrue(ltv > 0);
         assertFalse(isLiquidatable);
+
+        // 4. 验证 getLenderPosition
+        (
+            uint256 fTokenBalance,
+            uint256 exchangeRate,
+            uint256 underlyingBalance
+        ) = pool.getLenderPosition(alice);
+        assertEq(fTokenBalance, 1000 * 1e6);
+        assertEq(exchangeRate, 1e18);
+        assertEq(underlyingBalance, 1000 * 1e6);
     }
 
     // 测试 4: 正常还款流程 (验证利息和汇率增长)
@@ -173,9 +183,141 @@ contract LendingPoolTest is Test {
         // 池子资金: 10000 (本金) + 100 (利息) = 10100
         // 汇率 = 10100 / 10000 = 1.01
         assertEq(pool.getExchangeRate(), 1.01 * 1e18);
+
+        // 验证 getLenderPosition 返回的 underlyingBalance
+        (
+            uint256 fTokenBalanceAfter,
+            uint256 exchangeRateAfter,
+            uint256 underlyingBalanceAfter
+        ) = pool.getLenderPosition(alice);
+        assertEq(fTokenBalanceAfter, 10000 * 1e6);
+        assertEq(exchangeRateAfter, pool.getExchangeRate());
+        assertEq(underlyingBalanceAfter, 10100 * 1e6);
     }
 
-    // 测试 5: 异常测试 - 抵押不足
+    // 测试 5: 存款后部分取款
+    function testWithdrawPartial() public {
+        // Alice 存入 5000 USDT
+        vm.startPrank(alice);
+        usdt.approve(address(pool), 5000 * 1e6);
+        pool.deposit(5000 * 1e6);
+        vm.stopPrank();
+
+        // 取回 2000 USDT（此时汇率仍为 1，因此销毁 2000 份额）
+        vm.startPrank(alice);
+        pool.withdraw(2000 * 1e6);
+        vm.stopPrank();
+
+        // Alice: 初始 10000，存 5000 后剩 5000，取回 2000 -> 7000
+        assertEq(usdt.balanceOf(alice), 7000 * 1e6);
+        // LP 份额从 5000 降到 3000
+        assertEq(fToken.balanceOf(alice), 3000 * 1e6);
+        // 池子剩余 3000 流动性
+        assertEq(usdt.balanceOf(address(pool)), 3000 * 1e6);
+        // 汇率仍为 1
+        assertEq(pool.getExchangeRate(), 1e18);
+    }
+
+    // 测试 6: 存款 + 借款 + 还款后全部取款，Alice 收到本息
+    function testWithdrawAllAfterInterest() public {
+        // 1. Alice 存款
+        vm.startPrank(alice);
+        usdt.approve(address(pool), 10000 * 1e6);
+        pool.deposit(10000 * 1e6);
+        vm.stopPrank();
+
+        // 2. Bob 借款
+        mockChainlinkPrice(2000 * 1e8);
+        vm.startPrank(bob);
+        pool.borrow{value: 1 ether}(1000 * 1e6, 365 days);
+        vm.stopPrank();
+
+        // 3. Bob 还款
+        usdt.mint(bob, 100 * 1e6);
+        vm.startPrank(bob);
+        usdt.approve(address(pool), 1100 * 1e6);
+        pool.repay(0);
+        vm.stopPrank();
+
+        // 汇率应为 1.01
+        assertEq(pool.getExchangeRate(), 1.01 * 1e18);
+
+        // 4. Alice 赎回全部资产：按当前汇率计算应得的 USDT 金额
+        (, , uint256 underlyingBalanceBefore) = pool.getLenderPosition(alice);
+        vm.startPrank(alice);
+        pool.withdraw(underlyingBalanceBefore);
+        vm.stopPrank();
+
+        // Alice 拿回 10100 USDT (本金 + 利息)
+        assertEq(usdt.balanceOf(alice), underlyingBalanceBefore);
+        // LP 份额清零
+        assertEq(fToken.balanceOf(alice), 0);
+        // 池子 USDT 也应归零
+        assertEq(usdt.balanceOf(address(pool)), 0);
+    }
+
+    // 测试 7: 借出大部分资金后，流动性不足导致取款失败
+    function testCannotWithdrawWhenInsufficientLiquidity() public {
+        // Alice 存入 5000 USDT
+        vm.startPrank(alice);
+        usdt.approve(address(pool), 5000 * 1e6);
+        pool.deposit(5000 * 1e6);
+        vm.stopPrank();
+
+        // Bob 抵押 10 ETH 借 4000 USDT，池子只剩 1000 可用流动性
+        mockChainlinkPrice(2000 * 1e8);
+        vm.startPrank(bob);
+        pool.borrow{value: 10 ether}(4000 * 1e6, 30 days);
+        vm.stopPrank();
+
+        // Alice 尝试赎回 5000 USDT，应因流动性不足失败
+        vm.startPrank(alice);
+        vm.expectRevert("Insufficient liquidity");
+        pool.withdraw(5000 * 1e6);
+        vm.stopPrank();
+    }
+
+    // 测试 8: 到期后，即使贷款仍然健康，也可以通过 liquidateExpired 清算
+    function testLiquidateExpiredLoan() public {
+        // Alice 提供流动性
+        vm.startPrank(alice);
+        usdt.approve(address(pool), 5000 * 1e6);
+        pool.deposit(5000 * 1e6);
+        vm.stopPrank();
+
+        // 固定价格，保证贷款在价格维度是健康的
+        mockChainlinkPrice(2000 * 1e8);
+
+        // Bob 借款 30 天
+        vm.startPrank(bob);
+        pool.borrow{value: 1 ether}(1000 * 1e6, 30 days);
+        vm.stopPrank();
+
+        // 此时应是健康贷款，不能通过 liquidate 清算
+        (uint256 ltv, bool isLiquidatable) = pool.getLoanHealth(0);
+        assertTrue(ltv > 0);
+        assertFalse(isLiquidatable);
+
+        vm.startPrank(liquidator);
+        usdt.approve(address(pool), 2000 * 1e6);
+        vm.expectRevert("Health factor ok");
+        pool.liquidate(0);
+        vm.stopPrank();
+
+        // 时间快进超过 30 天，贷款到期
+        skip(31 days);
+
+        // 现在可以通过 liquidateExpired 清算
+        vm.startPrank(liquidator);
+        uint256 balBefore = liquidator.balance;
+        usdt.approve(address(pool), 2000 * 1e6);
+        pool.liquidateExpired(0);
+        uint256 balAfter = liquidator.balance;
+        assertTrue(balAfter > balBefore, "Liquidator should receive native token");
+        vm.stopPrank();
+    }
+
+    // 测试 9: 异常测试 - 抵押不足
     function testCannotBorrowInsufficientCollateral() public {
         mockChainlinkPrice(2000 * 1e8);
         vm.startPrank(bob);
@@ -186,7 +328,7 @@ contract LendingPoolTest is Test {
         vm.stopPrank();
     }
 
-    // 测试 6: 异常测试 - 试图清算健康贷款
+    // 测试 10: 异常测试 - 试图清算健康贷款
     function testCannotLiquidateHealthyLoan() public {
         // 准备环境
         vm.startPrank(alice);
@@ -208,7 +350,7 @@ contract LendingPoolTest is Test {
         vm.stopPrank();
     }
 
-    // 测试 7: getPoolState 聚合信息是否正确
+    // 测试 11: getPoolState 聚合信息是否正确
     function testGetPoolState() public {
         // Alice 存款 5000 USDT
         vm.startPrank(alice);
@@ -242,7 +384,7 @@ contract LendingPoolTest is Test {
         assertEq(exchangeRate, 1e18);
     }
 
-    // 测试 8: getUserPosition 聚合多笔贷款
+    // 测试 12: getUserPosition 聚合多笔贷款
     function testGetUserPositionAggregatesLoans() public {
         // Alice 先存入足够流动性
         vm.startPrank(alice);
@@ -281,7 +423,7 @@ contract LendingPoolTest is Test {
         assertEq(totalRepayment, repay0 + repay1);
     }
 
-    // 测试 9: deposit 金额为 0 时应 revert
+    // 测试 13: deposit 金额为 0 时应 revert
     function testCannotDepositZero() public {
         vm.startPrank(alice);
         usdt.approve(address(pool), 1);
@@ -290,7 +432,7 @@ contract LendingPoolTest is Test {
         vm.stopPrank();
     }
 
-    // 测试 10: 已还清的贷款再次还款应失败
+    // 测试 14: 已还清的贷款再次还款应失败
     function testCannotRepayInactiveLoan() public {
         // Alice 存款
         vm.startPrank(alice);
